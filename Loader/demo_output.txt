@@ -1,0 +1,119 @@
+
+============================================================
+  RSA Secure Boot Demo (Simplified Educational Version)
+============================================================
+  RSA key size: 32 bits
+  Signature size: 4 bytes
+  Firmware: C:\Users\dinhtuan.cao\STM32CubeIDE\cortexm\STM32H750_Application\Debug\STM32H750_Application.bin
+  Key file: rsa_keys_32.json
+
+[1] RSA Key Generation...
+  Keys loaded from rsa_keys_32.json
+    [OK] Key pair ready
+
+[2] Reading firmware...
+    File: C:\Users\dinhtuan.cao\STM32CubeIDE\cortexm\STM32H750_Application\Debug\STM32H750_Application.bin
+    Size: 24216 bytes
+
+[3] Signing firmware with private key (d)...
+    SHA-256 hash (32 bytes):
+      44cf85040641d7cefcbd5ac8bf4831800a7e466e1793b33b11cb3fa2b05d294f
+    First 4 bytes (big-endian): 44cf8504
+    Digest as integer: 1154450692 (0x44CF8504)
+    Step 3: digest mod n = 1154450692 (0x44CF8504)
+    Step 4: signature = digest^d mod n
+           = 2697257735
+           = 0xA0C4E307
+    Signature (4 bytes): a0c4e307
+
+    --- Manual Math Verification ---
+    SHA-256 first 4 bytes: 0x44CF8504 = 1154450692
+    digest mod n:          1154450692
+    n:                     3055077131
+    e:                     65537
+    d:                     2404741409
+
+    Signing:
+      signature = 1154450692^2404741409 mod 3055077131
+               = 2697257735
+
+    Verifying:
+      recovered = 2697257735^65537 mod 3055077131
+               = 1154450692
+
+      1154450692 == 1154450692 -> VALID
+    --- End Manual Math ---
+
+[4] Verifying signature with public key (e)...
+    SHA-256 hash (32 bytes):
+      44cf85040641d7cefcbd5ac8bf4831800a7e466e1793b33b11cb3fa2b05d294f
+    First 4 bytes (big-endian): 44cf8504
+    Digest as integer: 1154450692 (0x44CF8504)
+    Expected digest: 1154450692 (0x44CF8504)
+    Expected digest mod n: 1154450692
+    Step 3: recovered = signature^e mod n
+           = 1154450692
+           = 0x44CF8504
+    Step 4: 1154450692 == 1154450692 -> MATCH!
+    [OK] Signature verified -- firmware is authentic
+
+[5] Tampering firmware (flip 1 byte)...
+    Original byte at offset 1000: 0xB7
+    Tampered byte at offset 1000: 0xB6
+
+[6] Verifying tampered firmware...
+
+[4] Verifying signature with public key (e)...
+    SHA-256 hash (32 bytes):
+      1d4fe81f28e214ac66b9327535d2190540b93ba128a67c125723959d94029461
+    First 4 bytes (big-endian): 1d4fe81f
+    Digest as integer: 491776031 (0x1D4FE81F)
+    Expected digest: 491776031 (0x1D4FE81F)
+    Expected digest mod n: 491776031
+    Step 3: recovered = signature^e mod n
+           = 1154450692
+           = 0x44CF8504
+    Step 4: 1154450692 != 491776031 -> MISMATCH!
+    [FAIL] Signature verification FAILED
+    [OK] Tamper detection working correctly!
+
+[7] Building signed firmware file...
+    CRC32:      0x7266B1BD
+    Header:     12 bytes
+    Signature:  4 bytes
+    Firmware:   24216 bytes
+    Total:      24232 bytes
+    Output:     firmware_signed.bin
+    [OK] Signed firmware file created
+
+[8] Public key as C array (for STM32 embedding)...
+    /* RSA-32 Public Key -- embed in bootloader.c */
+    /* Modulus n (4 bytes, big-endian) */
+    const uint8_t rsa_public_n[4] = {
+        0xB6, 0x18, 0xC7, 0x0B
+    };
+
+    /* Public exponent e */
+    const uint32_t rsa_public_e = 65537UL;
+
+    /* Private exponent d (NEVER embed in device!) */
+    /* d = 2404741409 */
+    [OK] Copy public key (n, e) into bootloader.c
+
+============================================================
+  Summary
+============================================================
+  [OK] RSA-32 key pair generated
+  [OK] Firmware signed: signature = digest^d mod n
+  [OK] Signature verified: signature^e mod n == digest
+  [OK] Tampered firmware correctly rejected
+  [OK] Signed firmware file: firmware_signed.bin
+  [OK] Public key (n, e) printed for STM32 embedding
+
+  Security note:
+    RSA-32 is EDUCATIONAL ONLY -- not secure!
+    Use RSA-2048+ for production: python rsa_sign_demo.py --bits 2048
+
+  Next step: Implement rsa_verify() in STM32 bootloader
+  See: prompt/24_RSA_SECURE_BOOT_GUIDE.md
+============================================================
