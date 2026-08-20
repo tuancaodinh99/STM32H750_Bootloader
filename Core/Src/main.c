@@ -173,13 +173,15 @@ int main(void)
   uint32_t boot_timeout = HAL_GetTick() + 3000;
 
   uint8_t update_requested = 0;
-  uint8_t update_cmd[16];  /* Buffer for UPDATE command */
+  uint8_t update_cmd = 0;  /* Single-byte command buffer */
 
   while (HAL_GetTick() < boot_timeout) 
   {
-      /* Check for UPDATE command on UART (non-blocking) */
-      if (HAL_UART_Receive(&huart1, update_cmd, 6, 100) == HAL_OK) {
-          if (strncmp((char *)update_cmd, "UPDATE", 6) == 0) {
+      /* Check for UPDATE command on UART (1byte, non-blocking) */
+      if (HAL_UART_Receive(&huart1, &update_cmd, 1, 100) == HAL_OK) 
+      {
+          if (update_cmd == CMD_UPDATE_START)
+          {
               update_requested = 1;
               break;
           }
@@ -218,11 +220,28 @@ int main(void)
     }
     UART_SendLine(&huart1, "[OK] Memory-mapped mode enabled @ 0x90000000");
 
+#if (RSA_SECURE_BOOT_ENABLE == 1)
+    /* --- RSA SIGNATURE VERIFICATION (before jump) --- */
+    if (Bootloader_VerifyRSASignature() != 0)
+    {
+        UART_SendLine(&huart1, "[!] ERROR: RSA signature invalid!");
+        UART_SendLine(&huart1, "[!] Refusing to boot — staying in bootloader");
+        /* Send error code to host (if connected) */
+        Bootloader_SendErrorCmd("RSA_FAIL", ERROR_RSA);
+        /* Do NOT jump. Fall through to infinite loop (bootloader safe mode). */
+    }
+    else
+    {
+        UART_SendLine(&huart1, "[*] About to call Bootloader_JumpToApplication()...");
+        HAL_Delay(100);
+        Bootloader_JumpToApplication();
+    }
+#else
     UART_SendLine(&huart1, "[*] About to call Bootloader_JumpToApplication()...");
     HAL_Delay(100);
 
     Bootloader_JumpToApplication();
-
+#endif
 
     /* If we reach here, jump failed */
     UART_SendLine(&huart1, "[!] ERROR: Jump to application failed!");
