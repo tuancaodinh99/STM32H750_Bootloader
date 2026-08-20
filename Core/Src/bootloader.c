@@ -16,6 +16,7 @@ uint32_t fw_write_addr = QSPI_APP_ADDR;
 
 typedef void (*pFunction)(void);
 
+static void Bootloader_SendCmd(uint8_t cmd);
 static int8_t Bootloader_EraseExternalFlash(void);
 static int8_t Bootloader_WriteExternalFlash(uint32_t address, uint8_t *data, uint32_t size);
 static int8_t Bootloader_ReceiveFirmwareInfo(FirmwareInfo *info);
@@ -23,6 +24,39 @@ static int8_t Bootloader_ReceiveAndWrite(uint32_t expected_size, uint32_t *recei
 
 static uint8_t Bootloader_IsValidStackPointer(uint32_t sp);
 static uint32_t ReadLE32(const uint8_t *data);
+
+static uint32_t modpow32(uint32_t base, uint32_t exp, uint32_t mod);
+static uint32_t Bootloader_FindPayloadEnd(void);
+
+
+/*
+ * Modular exponentiation: base^exp mod mod
+ * For RSA-32: all values fit in uint32_t.
+ * Uses uint64_t for intermediate products to prevent overflow.
+ *
+ * Algorithm: Right-to-left binary method (square-and-multiply)
+ *   result = 1
+ *   for each bit of exp (LSB first):
+ *     if bit is 1: result = result * base mod mod
+ *     base = base * base mod mod
+ *     exp >>= 1
+*/
+static uint32_t modpow32(uint32_t base, uint32_t exp, uint32_t mod)
+{
+    uint32_t result = 1;
+    base = base % mod;
+
+    while (exp > 0)
+    {
+        if (exp & 1U)
+            result = (uint32_t)(((uint64_t)result * base) % mod);
+
+        exp >>= 1;
+        base = (uint32_t)(((uint64_t)base * base) % mod);
+    }
+
+    return result;
+}
 
 // ========== UART HELPER FUNCTIONS ==========
 // Send a string via UART
@@ -37,6 +71,19 @@ void UART_SendLine(UART_HandleTypeDef *huart, const char *str)
 {
 	UART_SendString(huart, str);
 	UART_SendString(huart, "\r\n");
+}
+
+/* Send a 1-byte protocol command code to the host */
+static void Bootloader_SendCmd(uint8_t cmd)
+{
+    HAL_UART_Transmit(&huart1, &cmd, 1, 100);
+}
+
+/* Send an error message (text debug) followed by a binary error code.*/
+void Bootloader_SendErrorCmd(const char *msg, uint8_t error_code)
+{
+    UART_SendLine(&huart1, msg);
+    Bootloader_SendCmd(error_code);
 }
 
 /**
@@ -56,7 +103,7 @@ static int8_t Bootloader_EraseExternalFlash(void)
 
         if (QSPI_Flash_EraseBlock(addr) != 0)
         {
-            UART_SendLine(&huart1, "ERROR: Erase failed!");
+            Bootloader_SendErrorCmd("ERROR!", ERROR_FLASH);
             return -1;
         }
 
@@ -147,14 +194,14 @@ static int8_t Bootloader_ReceiveFirmwareInfo(FirmwareInfo *info)
     if (HAL_UART_Receive(&huart1, header,
                          sizeof(header), 5000) != HAL_OK)
     {
-        UART_SendLine(&huart1, "ERROR: Firmware header timeout");
+        Bootloader_SendErrorCmd("ERROR!", ERROR_HEADER);
         return -1;
     }
 
     if (header[0] != 'F' || header[1] != 'W' ||
         header[2] != 'U' || header[3] != 'P')
     {
-        UART_SendLine(&huart1, "ERROR: Invalid firmware magic");
+        Bootloader_SendErrorCmd("ERROR!", ERROR_HEADER);
         return -1;
     }
 
@@ -163,7 +210,7 @@ static int8_t Bootloader_ReceiveFirmwareInfo(FirmwareInfo *info)
 
     if (info->size == 0U || info->size > QSPI_APP_MAX_SIZE)
     {
-        UART_SendLine(&huart1, "ERROR: Invalid firmware size");
+        Bootloader_SendErrorCmd("ERROR!", ERROR_HEADER);
         return -1;
     }
 
@@ -183,9 +230,12 @@ static int8_t Bootloader_ReceiveAndWrite(uint32_t expected_size, uint32_t *recei
         return -1;
     }
 
-    // Ready notification
+    /* Optional debug text — host does NOT parse this */
     UART_SendLine(&huart1, "Waiting for firmware upload...");
     UART_SendLine(&huart1, "Send binary data (max 8 MB)");
+
+    /* Send binary status: flash ready, can receive firmware data */
+    Bootloader_SendCmd(STATUS_UPDATE_READY);
 
     // Initialize the receive state.
     uint32_t running_crc = CRC32_Init();
@@ -207,9 +257,7 @@ static int8_t Bootloader_ReceiveAndWrite(uint32_t expected_size, uint32_t *recei
 
         if (HAL_UART_Receive(&huart1, chunk_header, sizeof(chunk_header), 5000) != HAL_OK)
         {
-#if (BOOT_TEST == 1)
-            UART_SendLine(&huart1, "ERROR: Timeout receiving chunk header");
-#endif
+            Bootloader_SendErrorCmd("ERROR!", ERROR_CHUNK);
             return -1;
         }
 
@@ -218,7 +266,7 @@ static int8_t Bootloader_ReceiveAndWrite(uint32_t expected_size, uint32_t *recei
         /* A zero-length chunk is the only valid end marker. */
         if (chunk_len == 0U)
         {
-            UART_SendLine(&huart1, "ERROR: Firmware ended prematurely");
+            Bootloader_SendErrorCmd("ERROR!", ERROR_CHUNK);
             return -1;
         }
 
@@ -230,15 +278,13 @@ static int8_t Bootloader_ReceiveAndWrite(uint32_t expected_size, uint32_t *recei
         if (chunk_len > CHUNK_SIZE ||
             chunk_len > (expected_size - fw_received))
         {
-            UART_SendLine(&huart1, "ERROR: Invalid chunk length");
+            Bootloader_SendErrorCmd("ERROR!", ERROR_CHUNK);
             return -1;
         }
 
         if (HAL_UART_Receive(&huart1, fw_chunk, chunk_len, 5000) != HAL_OK)
         {
-#if (BOOT_TEST == 1) 
-            UART_SendLine(&huart1, "ERROR: Timeout receiving chunk data");
-#endif
+            Bootloader_SendErrorCmd("ERROR!", ERROR_CHUNK);
             return -1;
         }
 
@@ -247,20 +293,16 @@ static int8_t Bootloader_ReceiveAndWrite(uint32_t expected_size, uint32_t *recei
         // Write to external flash
         if (Bootloader_WriteExternalFlash(fw_write_addr, fw_chunk, chunk_len) != 0)
         {
-#if (BOOT_TEST == 1) 
-            UART_SendLine(&huart1, "ERROR: External flash write failed");
-#endif
+            Bootloader_SendErrorCmd("ERROR!", ERROR_FLASH);
             return -1;  /* Write error */
         }
 
         fw_write_addr += chunk_len;
         fw_received += chunk_len;
 
-        /* Send ACK so the host knows this chunk was processed
-         * and the next one can be transmitted safely. */
-        UART_SendLine(&huart1, "ACK");
+        /* Send binary ACK: chunk received and written successfully */
+        Bootloader_SendCmd(STATUS_CHUNK_ACK);
     }
-
 
     /*
     * At this point, exactly expected_size bytes have been received.
@@ -270,9 +312,7 @@ static int8_t Bootloader_ReceiveAndWrite(uint32_t expected_size, uint32_t *recei
 
     if (HAL_UART_Receive(&huart1, end_header, sizeof(end_header), 5000) != HAL_OK)
     {
-#if (BOOT_TEST == 1)
-        UART_SendLine(&huart1, "ERROR: Timeout receiving end marker");
-#endif
+        Bootloader_SendErrorCmd("ERROR!", ERROR_HEADER);
         return -1;
     }
 
@@ -280,9 +320,7 @@ static int8_t Bootloader_ReceiveAndWrite(uint32_t expected_size, uint32_t *recei
 
     if (end_marker != 0U)
     {
-#if (BOOT_TEST == 1)
-        UART_SendLine(&huart1, "ERROR: Invalid end-of-transfer marker");
-#endif
+        Bootloader_SendErrorCmd("ERROR!", ERROR_HEADER);
         return -1;
     }
 
@@ -315,40 +353,34 @@ int8_t Bootloader_UpdateFirmware(void)
     uint32_t received_crc;
     uint32_t flash_crc;
 
-    UART_SendLine(&huart1, "=== FIRMWARE UPDATE MODE ===");
-
-    /* Receive size and expected CRC before erasing the old app.*/
-
-    // Step 0: Check firmware infomation
+    /* Step 0: Receive and validate firmware metadata */
     if (Bootloader_ReceiveFirmwareInfo(&firmware) != 0)
         return -1;
     
-    // Step 1: Erase external flash
+    /* Step 1: Erase external flash */
     if (Bootloader_EraseExternalFlash() != 0)
         return -1;
 
-    // Step 2: Receive and write firmware
+    /*
+     * Step 2: Receive and write payload (firmware + signature + footer + marker)
+     *         to flash. The payload starts at QSPI_APP_ADDR = 0x00.
+     *         NO header is stored in flash — only the payload.
+     *         firmware.size = fw_size + RSA_SIG_SIZE + FW_SIZE_FOOTER_SIZE
+     *                         + PAYLOAD_END_MARKER_SIZE
+     */
     if (Bootloader_ReceiveAndWrite(firmware.size, &received_crc) != 0)
         return -1;
 
-    // Step 3: CRC check
+    /* Step 3: CRC check (UART receive CRC) */
+
     if (received_crc != firmware.crc32)
     {
-        char msg[96];
-
-        snprintf(msg, sizeof(msg),
-                    "ERROR: CRC mismatch: "
-                    "expected=%08lX received=%08lX",
-                    (unsigned long)firmware.crc32,
-                    (unsigned long)received_crc);
-
-        UART_SendLine(&huart1, msg);
+        Bootloader_SendErrorCmd("ERROR!", ERROR_CRC);
         return -1;
     }
-
     UART_SendLine(&huart1, "[OK] UART firmware CRC verified");
 
-    /* Continue with QSPI read-back CRC verification... */
+    /* Step 4: Flash read-back CRC */
     if (QSPI_Flash_EnterMemoryMappedMode() != 0)
         return -1;
 
@@ -356,11 +388,23 @@ int8_t Bootloader_UpdateFirmware(void)
 
     if (flash_crc != firmware.crc32)
     {
-        UART_SendLine(&huart1, "ERROR: Flash read-back CRC mismatch");
+        Bootloader_SendErrorCmd("ERROR!", ERROR_CRC);
         return -1;
     }
-
     UART_SendLine(&huart1, "[OK] External flash CRC verified");
+
+#if (RSA_SECURE_BOOT_ENABLE == 1)
+    /* Step 5: RSA signature verification */
+    if (Bootloader_VerifyRSASignature() != 0)
+    {
+        Bootloader_SendErrorCmd("RSA_FAIL", ERROR_RSA);
+        return -1;
+    }
+    UART_SendLine(&huart1, "[OK] RSA signature verified during update");
+#endif
+
+    /* All checks passed — notify host */
+    Bootloader_SendCmd(STATUS_UPDATE_COMPLETE);
 
     /*
      * Do NOT reset here.  Return to main() so it can print the
@@ -392,6 +436,196 @@ static uint8_t Bootloader_IsValidStackPointer(uint32_t sp)
 
     return in_dtcm || in_axi_sram || in_d2_sram || in_d3_sram;
 }
+
+/*
+ * Find the end of payload in flash using binary search.
+ *
+ * Flash is erased to 0xFF before writing payload. After the payload,
+ * the remaining flash is 0xFF. This function finds the first 0xFF byte
+ * (the boundary between payload data and erased flash), then verifies
+ * the magic marker 0x55667788 is present just before the boundary.
+ *
+ * Uses binary search: only ~23 byte reads for 8MB flash (log2(8MB) = 23).
+ * Returns: offset of the magic marker (= payload_end - MARKER_SIZE),
+ *          or 0 if flash empty or marker not found.
+ */
+static uint32_t Bootloader_FindPayloadEnd(void)
+{
+    const volatile uint8_t *flash = (const volatile uint8_t *)QSPI_BASE_ADDR;
+    uint32_t lo = 0;                       /* flash[lo] is data (!= 0xFF) */
+    uint32_t hi = QSPI_APP_MAX_SIZE;       /* flash[hi] is 0xFF (or out of range) */
+
+    /* Edge case: flash is completely empty (first byte is 0xFF) */
+    if (flash[0] == 0xFF)
+        return 0;
+
+    /* Binary search: narrow down data/0xFF boundary */
+    while ((hi - lo) > 1U)
+    {
+        uint32_t mid = lo + ((hi - lo) / 2U);
+
+        if (flash[mid] != 0xFF)
+            lo = mid;      /* data extends at least to mid */
+        else
+            hi = mid;      /* 0xFF starts at or before mid */
+    }
+
+    /*
+     * lo = last data byte, hi = first 0xFF byte.
+     * Verify the magic marker 0x55667788 is at (hi - PAYLOAD_END_MARKER_SIZE).
+     * This confirms we found the real payload boundary, not a 0xFF inside firmware.
+     */
+    uint32_t marker_offset = hi - PAYLOAD_END_MARKER_SIZE;
+    uint32_t marker_val = *(volatile uint32_t *)(QSPI_BASE_ADDR + marker_offset);
+
+    if (marker_val != PAYLOAD_END_MARKER)
+    {
+        /* Marker not found — boundary detection failed */
+        return 0;
+    }
+
+    /* Return offset of the marker (start of the marker, not the 0xFF) */
+    return marker_offset;
+}
+
+/*
+ * Verify RSA signature of firmware in external flash.
+ *
+ * Prerequisites:
+ *   - QSPI must be in memory-mapped mode (XIP)
+ *   - Firmware must have been written to flash
+ *   - Flash must have been fully erased (0xFF) before writing payload
+ *
+ * Flash layout (at QSPI_BASE_ADDR = 0x90000000):
+ *   [0x00]               Firmware binary (fw_size bytes)
+ *                        Vector table: SP at 0x00, Reset_Handler at 0x04
+ *   [0x00+fw_size]       RSA signature (RSA_SIG_SIZE bytes)
+ *   [0x00+fw_size+sig]   fw_size footer (4 bytes, little-endian)
+ *   [0x00+fw_size+sig+4] Magic marker 0x55667788 (4 bytes)
+ *   [0x00+fw_size+sig+8] 0xFF ... (erased flash)
+ *
+ * The header (12 bytes) is NOT in flash — only used during UART transfer.
+ * On boot, binary search finds the data/0xFF boundary, then verifies the
+ * magic marker 0x55667788 is present just before the boundary.
+ * fw_size is read from the 4 bytes before the marker.
+ *
+ * Returns:  0 = signature valid
+ *          -1 = signature invalid or error
+ */
+int8_t Bootloader_VerifyRSASignature(void)
+{
+    uint8_t  sha256_digest[SHA256_DIGEST_SIZE];
+    uint8_t  sig_bytes[RSA_SIG_SIZE];
+    uint32_t expected_digest;
+    uint32_t recovered;
+    uint32_t signature_val;
+    uint32_t n_val;
+    uint32_t fw_size;
+    uint32_t marker_offset;
+    uint32_t sig_addr;
+
+    UART_SendLine(&huart1, "[*] Verifying RSA signature...");
+
+    /*
+     * Step 1: Find payload end using binary search (data/0xFF boundary).
+     *         ~23 byte reads for 8MB flash — instant on QSPI XIP.
+     *         Verify magic marker 0x55667788 is present.
+     */
+    marker_offset = Bootloader_FindPayloadEnd();
+
+    if (marker_offset == 0U)
+    {
+        UART_SendLine(&huart1, "[!] ERROR: Flash empty or magic marker not found");
+        return -1;
+    }
+
+    if (marker_offset < (RSA_SIG_SIZE + FW_SIZE_FOOTER_SIZE))
+    {
+        UART_SendLine(&huart1, "[!] ERROR: Payload too small for signature + footer");
+        return -1;
+    }
+
+    /*
+     * Step 2: Read fw_size from the footer (4 bytes before the marker).
+     *         marker_offset points to the start of the magic marker.
+     *         footer is at (marker_offset - FW_SIZE_FOOTER_SIZE).
+     */
+    fw_size = *(volatile uint32_t *)(QSPI_BASE_ADDR + marker_offset - FW_SIZE_FOOTER_SIZE);
+
+    if (fw_size == 0U || fw_size == 0xFFFFFFFFU || fw_size > QSPI_APP_MAX_SIZE)
+    {
+        char msg[80];
+        snprintf(msg, sizeof(msg),
+                 "[!] ERROR: Invalid fw_size in footer: 0x%08lX",
+                 (unsigned long)fw_size);
+        UART_SendLine(&huart1, msg);
+        return -1;
+    }
+
+    /*
+     * Step 3: Read the RSA signature from flash.
+     *         Signature is at (QSPI_BASE_ADDR + fw_size), right after the
+     *         firmware binary. Firmware starts at QSPI_BASE_ADDR (offset 0x00).
+     */
+    sig_addr = QSPI_BASE_ADDR + fw_size;
+    const uint8_t *sig_src = (const uint8_t *)sig_addr;
+    for (uint32_t i = 0; i < RSA_SIG_SIZE; i++)
+        sig_bytes[i] = sig_src[i];
+
+    /*
+     * Step 4: Compute SHA-256 over the firmware binary only.
+     *         Firmware starts at QSPI_BASE_ADDR (offset 0x00 in flash).
+     *         SHA-256 covers exactly fw_size bytes (NOT the signature/footer).
+     */
+    sha256_hash((const uint8_t *)QSPI_BASE_ADDR, fw_size, sha256_digest);
+
+    /*
+     * Step 5: Take first 4 bytes of SHA-256 as 32-bit digest (big-endian).
+     *         This matches the Python demo: int.from_bytes(hash[:4], 'big')
+     */
+    expected_digest = ((uint32_t)sha256_digest[0] << 24) |
+                       ((uint32_t)sha256_digest[1] << 16) |
+                       ((uint32_t)sha256_digest[2] <<  8) |
+                       ((uint32_t)sha256_digest[3]);
+
+    /*
+     * Step 6: Convert signature bytes to uint32_t (big-endian).
+     *         The Python demo stores signature as big-endian bytes.
+     */
+    signature_val = 0;
+    for (uint32_t i = 0; i < RSA_SIG_SIZE; i++)
+        signature_val = (signature_val << 8) | sig_bytes[i];
+
+    /*
+     * Step 7: Convert modulus n from byte array to uint32_t (big-endian).
+     */
+    n_val = 0;
+    for (uint32_t i = 0; i < RSA_SIG_SIZE; i++)
+        n_val = (n_val << 8) | rsa_public_n[i];
+
+    /*
+     * Step 8: RSA verify — recovered = signature^e mod n
+     *         If valid, recovered should equal (expected_digest mod n).
+     */
+    recovered = modpow32(signature_val, RSA_PUBLIC_E, n_val);
+
+    uint32_t expected_mod = expected_digest % n_val;
+
+    if (recovered != expected_mod)
+    {
+        char msg[96];
+        snprintf(msg, sizeof(msg),
+                 "[!] RSA FAIL: recovered=0x%08lX, expected=0x%08lX",
+                 (unsigned long)recovered, (unsigned long)expected_mod);
+        UART_SendLine(&huart1, msg);
+        UART_SendLine(&huart1, "[!] ERROR: RSA signature verification FAILED");
+        return -1;
+    }
+
+    UART_SendLine(&huart1, "[OK] RSA signature verified — firmware is authentic");
+    return 0;
+}
+
 
 void Bootloader_JumpToApplication(void)
 {
